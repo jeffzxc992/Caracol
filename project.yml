@@ -1,0 +1,77 @@
+name: Caracol
+options:
+  bundleIdPrefix: com.caracol
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_OPTIMIZATION_LEVEL: "-O"
+    GCC_OPTIMIZATION_LEVEL: "s"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  Caracol:
+    type: application
+    platform: macOS
+    sources:
+      - path: Caracol
+        excludes:
+          - "Resources/Info.plist"
+          - "Resources/Caracol.entitlements"
+          - "Resources/Models"
+    resources:
+      - path: Caracol/Resources/Models/IFRNetLite.mlmodelc
+      - path: Caracol/Resources/Models/IFRNetLite.mtlpackage
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.caracol.app
+        PRODUCT_NAME: Caracol
+        INFOPLIST_FILE: Caracol/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Caracol/Resources/Caracol.entitlements
+        COMBINE_HIDPI_IMAGES: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - sdk: ScreenCaptureKit.framework
+      - sdk: Metal.framework
+      - sdk: MetalFX.framework
+      - sdk: CoreML.framework
+      - sdk: AVFoundation.framework
+      - sdk: VideoToolbox.framework
+      - sdk: IOKit.framework
+      - sdk: Carbon.framework
+  CaracolTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CaracolTests
+    dependencies:
+      - target: Caracol
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.caracol.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+schemes:
+  Caracol:
+    build:
+      targets:
+        Caracol: all
+        CaracolTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - CaracolTests
+    archive:
+      config: Release
