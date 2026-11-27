@@ -8,20 +8,12 @@ Caracol is a macOS application for real-time frame interpolation and game captur
 - Frame interpolation powered by CoreML (IFRNetLite)
 - Metal / MetalFX rendering pipeline
 - Configurable capture and display settings
-- System metrics and telemetry helpers
+- Powered by Apple Neural Engine
 
 ## Requirements
 
 - macOS 26.0 or later
-- Xcode with Swift 5
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen) (to generate the Xcode project from `project.yml`)
-
-## Build
-
-```bash
-xcodegen generate
-open Caracol.xcodeproj
-```
+- Apple Silicon M1 or later
 
 ## Project structure
 
@@ -34,7 +26,3 @@ Caracol/
 └── Telemetry/        # Metrics store
 project.yml           # XcodeGen project definition
 ```
-
-## License
-
-All rights reserved.
