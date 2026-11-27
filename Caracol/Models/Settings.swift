@@ -82,6 +82,7 @@ struct CaracolSettings: Codable, Equatable {
     var flowQuality: FlowQuality = .quarter
     var forceFullScreen: Bool = false
     var frameGeneration: Bool = true
+    var interpolation: Bool = false
     var inferenceRoute: InferenceRoute = .gpuOnly
     var hotkeyEnabled: Bool = true
     var displayRefresh: Int = 60

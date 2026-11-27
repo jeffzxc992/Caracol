@@ -13,7 +13,13 @@ struct GameProfile: Codable, Identifiable, Equatable {
     var id: String { key }
 
     static func key(bundleID: String?, title: String, windowID: UInt32?) -> String {
-        if let bundleID, !bundleID.isEmpty { return "bundle:\(bundleID)" }
+        if let bundleID, !bundleID.isEmpty, bundleID != "com.caracol.video-test" {
+            return "bundle:\(bundleID)"
+        }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed.lowercased() != "game", trimmed.lowercased() != "display" {
+            return "title:\(trimmed.lowercased())"
+        }
         if let windowID { return "window:\(windowID)" }
         return "title:\(title.lowercased())"
     }

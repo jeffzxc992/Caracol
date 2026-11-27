@@ -1,0 +1,7 @@
+{
+  "name": "IFRNetLite",
+  "width": 256,
+  "height": 144,
+  "trained": false,
+  "note": "Bundled plumbing stub: identity flow. Replace via Tools/convert_model.py, set trained=true, and rebuild the app to let autocalibration consider Quality mode."
+}

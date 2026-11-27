@@ -30,6 +30,7 @@ targets:
     resources:
       - path: Caracol/Resources/Models/IFRNetLite.mlmodelc
       - path: Caracol/Resources/Models/IFRNetLite.mtlpackage
+      - path: Caracol/Resources/Models/IFRNetLite.model-info.json
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.caracol.app

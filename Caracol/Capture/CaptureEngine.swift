@@ -4,10 +4,10 @@ import CoreMedia
 import CoreVideo
 import AppKit
 
-struct CaptureLayout {
+struct CaptureLayout: Equatable {
     var contentRect: CGRect          // points, global top-left
     var overlayRect: NSRect          // points, AppKit coordinates
-    var inputSize: CGSize            // pixels sent to the renderer
+    var inputSize: CGSize            // pixels captured (before upscaling)
     var outputSize: CGSize           // pixels of the overlay drawable
     var title: String
     var bundleID: String?
@@ -19,6 +19,10 @@ struct CaptureLayout {
         guard outputSize.height > 0 else { return 1 }
         return outputSize.width / outputSize.height
     }
+
+    var profileKey: String {
+        GameProfile.key(bundleID: bundleID, title: title, windowID: windowID)
+    }
 }
 
 protocol CaptureEngineDelegate: AnyObject {
@@ -29,19 +33,21 @@ protocol CaptureEngineDelegate: AnyObject {
 }
 
 /// ScreenCaptureKit capture with the system content-sharing picker. The picker
-/// path is deliberately used because it grants one-shot access without the
-/// Screen Recording TCC prompt. Frames are zero-copy IOSurfaces; this class
-/// only wraps them in CapturedFrame values and publishes the latest one.
+/// path is used because it grants one-shot access without the Screen Recording
+/// TCC prompt. Frames are zero-copy IOSurfaces; this class only wraps them in
+/// CapturedFrame values and publishes the latest one.
 final class CaptureEngine: NSObject {
     weak var delegate: CaptureEngineDelegate?
 
     let mailbox = FrameMailbox()
     private(set) var layout: CaptureLayout?
-    private(set) var isCapturing = false
-    private(set) var isPaused = false
 
     private let picker = SCContentSharingPicker.shared
     private let captureQueue = DispatchQueue(label: "com.caracol.capture", qos: .userInteractive)
+    private let stateLock = NSLock()
+    private var _isCapturing = false
+    private var _isPaused = false
+
     private var stream: SCStream?
     private var filter: SCContentFilter?
     private var settings: CaracolSettings
@@ -52,20 +58,34 @@ final class CaptureEngine: NSObject {
     private var sourceBundleID: String?
     private var sourceWindowID: UInt32?
     private var sourceIsDisplay = false
+    private let pickerConfiguration: SCContentSharingPickerConfiguration = {
+        var config = SCContentSharingPickerConfiguration()
+        config.allowedPickerModes = [.singleWindow, .singleDisplay]
+        config.allowsChangingSelectedContent = true
+        return config
+    }()
+    private let opaqueBlack = CGColor(gray: 0, alpha: 1)
+
+    var isCapturing: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _isCapturing
+    }
+
+    var isPaused: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _isPaused
+    }
 
     init(settings: CaracolSettings, displayRefresh: Int) {
         self.settings = settings
         self.displayRefresh = displayRefresh
         super.init()
-        picker.addObserver(self)
-        let config = SCContentSharingPickerConfiguration()
-        config.allowedPickerModes = [.singleWindow, .singleDisplay]
-        config.allowsChangingSelectedContent = true
-        picker.defaultConfiguration = config
+        picker.add(self)
+        picker.defaultConfiguration = pickerConfiguration
     }
 
     deinit {
-        picker.removeObserver(self)
+        picker.remove(self)
     }
 
     func update(settings: CaracolSettings, displayRefresh: Int) {
@@ -81,6 +101,7 @@ final class CaptureEngine: NSObject {
     func presentPicker() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            NSApp.activate(ignoringOtherApps: true)
             self.picker.isActive = true
             self.picker.present()
         }
@@ -92,8 +113,7 @@ final class CaptureEngine: NSObject {
     }
 
     func stop() {
-        isCapturing = false
-        isPaused = false
+        setState(capturing: false, paused: false)
         stream?.stopCapture { _ in }
         stream = nil
         filter = nil
@@ -105,7 +125,7 @@ final class CaptureEngine: NSObject {
 
     func pause() {
         guard isCapturing, !isPaused else { return }
-        isPaused = true
+        setState(capturing: true, paused: true)
         stream?.stopCapture { error in
             if let error { LogStore.warn("capture", "Pause stop error: \(error)") }
         }
@@ -114,7 +134,7 @@ final class CaptureEngine: NSObject {
 
     func resume() {
         guard isPaused else { return }
-        isPaused = false
+        setState(capturing: true, paused: false)
         if let filter {
             start(filter: filter, resetLayout: false)
         }
@@ -122,16 +142,24 @@ final class CaptureEngine: NSObject {
 
     // MARK: - Stream lifecycle
 
+    private func setState(capturing: Bool, paused: Bool) {
+        stateLock.lock()
+        _isCapturing = capturing
+        _isPaused = paused
+        stateLock.unlock()
+    }
+
     private func start(filter: SCContentFilter, resetLayout: Bool) {
-        stream?.stopCapture { _ in }
+        let oldStream = stream
         stream = nil
+        oldStream?.stopCapture { _ in }
         self.filter = filter
 
+        let previousLayout = layout
         let contentRect = filter.contentRect
-        let pointScale = CGFloat(max(filter.pointPixelScale, 1))
         sourceIsDisplay = filter.style == .display
         if let window = filter.includedWindows.first {
-            sourceTitle = window.title?.isEmpty == false ? window.title! : "Game"
+            sourceTitle = window.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Game"
             sourceBundleID = window.owningApplication?.bundleIdentifier
             sourceWindowID = window.windowID
         } else if let display = filter.includedDisplays.first {
@@ -144,8 +172,9 @@ final class CaptureEngine: NSObject {
             sourceWindowID = nil
         }
 
-        // The overlay always covers the game window. If the window is effectively
-        // fullscreen, use the whole display so the menu bar / dock area is invisible.
+        // The overlay always covers the game content. If the content is
+        // effectively fullscreen, use the whole display so menu bar / dock
+        // remnants are not visible around it.
         let screen = ScreenGeometry.screen(containingCaptureRect: contentRect) ?? NSScreen.main
         let fullScreenOverlay = settings.forceFullScreen || ScreenGeometry.coversDisplay(contentRect)
         let overlayRect: NSRect
@@ -163,12 +192,12 @@ final class CaptureEngine: NSObject {
             height: max(64, (overlayRect.height * screenScale).rounded())
         )
 
-        let divisor = max(1.0, settings.upscale.factor)
-        var inputSize = CGSize(
-            width: (outputSize.width / divisor).rounded(),
-            height: (outputSize.height / divisor).rounded()
+        let sourceAspect = contentRect.height > 0 ? contentRect.width / contentRect.height : 16.0 / 9.0
+        let target = CGSize(
+            width: max(2, outputSize.width / max(1, settings.upscale.factor)),
+            height: max(2, outputSize.height / max(1, settings.upscale.factor))
         )
-        // Keep both dimensions even; MetalFX and most video paths prefer it.
+        var inputSize = Self.fit(aspect: sourceAspect, into: target)
         inputSize.width = max(2, (inputSize.width / 2).rounded() * 2)
         inputSize.height = max(2, (inputSize.height / 2).rounded() * 2)
 
@@ -184,28 +213,31 @@ final class CaptureEngine: NSObject {
             fullScreenOverlay: fullScreenOverlay
         )
         layout = newLayout
-        if resetLayout || layout == nil {
+        if resetLayout || previousLayout != newLayout {
             delegate?.captureEngine(self, didProduce: newLayout)
         }
 
-        let config = SCStreamConfiguration()
-        config.width = Int(inputSize.width)
-        config.height = Int(inputSize.height)
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(30, min(120, displayRefresh))))
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.queueDepth = 1
-        config.showsCursor = false
-        config.showMouseClicks = false
-        config.capturesAudio = false
-        config.scalesToFit = true
-        config.preservesAspectRatio = true
-        config.captureResolution = .best
-        config.shouldBeOpaque = true
-        config.ignoreShadowsSingleWindow = true
-        config.ignoreShadowsDisplay = true
-        config.backgroundColor = CGColor(gray: 0, alpha: 1)
+        let configuration = SCStreamConfiguration()
+        configuration.width = Int(inputSize.width)
+        configuration.height = Int(inputSize.height)
+        configuration.minimumFrameInterval = CMTime(
+            value: 1,
+            timescale: CMTimeScale(max(30, min(120, displayRefresh)))
+        )
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.queueDepth = 1
+        configuration.showsCursor = false
+        configuration.showMouseClicks = false
+        configuration.capturesAudio = false
+        configuration.scalesToFit = true
+        configuration.preservesAspectRatio = true
+        configuration.captureResolution = .best
+        configuration.shouldBeOpaque = true
+        configuration.ignoreShadowsSingleWindow = true
+        configuration.ignoreShadowsDisplay = true
+        configuration.backgroundColor = opaqueBlack
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
         } catch {
@@ -214,13 +246,13 @@ final class CaptureEngine: NSObject {
             return
         }
         self.stream = stream
-        stream.startCapture { [weak self] error in
-            guard let self else { return }
+        stream.startCapture { [weak self, weak stream] error in
+            guard let self, let stream, self.stream === stream else { return }
             if let error {
                 LogStore.error("capture", "startCapture failed: \(error)")
                 DispatchQueue.main.async { self.delegate?.captureEngine(self, didFail: error) }
             } else {
-                self.isCapturing = true
+                self.setState(capturing: true, paused: false)
                 LogStore.info("capture", "Capture started: \(self.sourceTitle) \(Int(inputSize.width))x\(Int(inputSize.height))")
                 DispatchQueue.main.async {
                     self.delegate?.captureEngine(self, didProduce: newLayout)
@@ -235,14 +267,12 @@ final class CaptureEngine: NSObject {
         // Drop idle / blank frames. ScreenCaptureKit emits idle frames when the
         // content has not changed; presenting them wastes energy and inflates fps.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-           let raw = attachments.first?[.status] as? Int,
-           let status = SCFrameStatus(rawValue: raw),
+           let raw = attachments.first?[.status] as? NSNumber,
+           let status = SCFrameStatus(rawValue: raw.intValue),
            status != .complete {
             return nil
         }
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
         let frameLayout = layout
         let rect = frameLayout?.contentRect ?? .zero
         return CapturedFrame(
@@ -250,13 +280,23 @@ final class CaptureEngine: NSObject {
             pixelBuffer: pixelBuffer,
             hostTime: hostNow(),
             contentRect: rect,
-            contentScale: frameLayout != nil ? CGFloat(max(1, (frameLayout!.outputSize.width / max(1, rect.width)))) : 2,
-            sourceSize: CGSize(width: width, height: height),
+            contentScale: CGFloat(max(1, (filter?.pointPixelScale ?? 2))),
+            sourceSize: CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
+                               height: CVPixelBufferGetHeight(pixelBuffer)),
             title: sourceTitle,
             bundleID: sourceBundleID,
             windowID: sourceWindowID,
             isDisplay: sourceIsDisplay
         )
+    }
+
+    private static func fit(aspect: CGFloat, into size: CGSize) -> CGSize {
+        guard aspect > 0, size.width > 0, size.height > 0 else { return size }
+        let containerAspect = size.width / size.height
+        if containerAspect > aspect {
+            return CGSize(width: (size.height * aspect).rounded(), height: size.height)
+        }
+        return CGSize(width: size.width, height: (size.width / aspect).rounded())
     }
 }
 
@@ -291,7 +331,7 @@ extension CaptureEngine: SCStreamOutput {
 extension CaptureEngine: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         LogStore.error("capture", "Stream stopped with error: \(error)")
-        isCapturing = false
+        setState(capturing: false, paused: false)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.delegate?.captureEngine(self, didFail: error)

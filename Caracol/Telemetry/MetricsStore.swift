@@ -27,7 +27,9 @@ struct FPSMeter {
     mutating func reset() { timestamps.removeAll(keepingCapacity: true) }
 }
 
-@MainActor
+/// Thread-safe metrics collector. Counters are touched from capture, render and
+/// ML callbacks; published values are only mutated on the main thread so the
+/// SwiftUI HUD stays consistent.
 final class MetricsStore: ObservableObject {
     @Published private(set) var sourceFPS: Double = 0
     @Published private(set) var realFPS: Double = 0
@@ -51,6 +53,7 @@ final class MetricsStore: ObservableObject {
     @Published private(set) var calibrationProgress: Double = 0
     @Published private(set) var calibrationText: String = ""
 
+    private let lock = NSLock()
     private var sourceMeter = FPSMeter()
     private var realCounter = 0
     private var generatedCounter = 0
@@ -64,95 +67,121 @@ final class MetricsStore: ObservableObject {
     private var lastTick = hostNow()
 
     func noteSourceFrame(at time: CFTimeInterval = hostNow()) {
+        lock.lock()
         sourceMeter.record(time)
-        sourceFPS = sourceMeter.value(at: time)
+        let fps = sourceMeter.value(at: time)
+        lock.unlock()
+        publish { self.sourceFPS = fps }
     }
 
     func notePresented(kind: PresentedKind, latency: Double) {
+        lock.lock()
         switch kind {
         case .real: realCounter += 1
         case .generated: generatedCounter += 1
+        case .duplicate: break
         }
         presentedCounter += 1
-        if latency > 0 {
+        if kind != .duplicate, latency > 0 {
             latencyRing.append(latency * 1000.0)
         }
+        lock.unlock()
     }
 
     func noteFrameTime(ms: Double) {
-        frameTimeEMA.update(ms)
+        lock.lock(); _ = frameTimeEMA.update(ms); lock.unlock()
     }
 
     func noteFlowTime(ms: Double) {
-        flowEMA.update(ms)
+        lock.lock(); _ = flowEMA.update(ms); lock.unlock()
     }
 
     func noteGPUTime(ms: Double) {
-        gpuEMA.update(ms)
+        lock.lock(); _ = gpuEMA.update(ms); lock.unlock()
     }
 
     func noteInferenceTime(ms: Double) {
-        aneEMA.update(ms)
+        lock.lock(); _ = aneEMA.update(ms); lock.unlock()
     }
 
     func setStatus(_ text: String) {
-        status = text
+        publish { self.status = text }
     }
 
     func setSource(_ info: CaptureSourceInfo) {
-        sourceTitle = info.title
+        publish { self.sourceTitle = info.title }
     }
 
     func setMode(_ settings: CaracolSettings) {
-        modeLabel = settings.mode.label
-        scaleLabel = settings.upscale.label
-        targetFPS = settings.targetFPS
+        publish {
+            self.modeLabel = settings.mode.label
+            self.scaleLabel = settings.upscale.label
+            self.targetFPS = settings.targetFPS
+        }
     }
 
     func setCalibration(progress: Double, text: String) {
-        calibrationProgress = clamp(progress, 0, 1)
-        calibrationText = text
+        publish {
+            self.calibrationProgress = clamp(progress, 0, 1)
+            self.calibrationText = text
+        }
     }
 
     func finishCalibration() {
-        calibrationProgress = 1
-        calibrationText = "Ready"
+        publish {
+            self.calibrationProgress = 1
+            self.calibrationText = "Ready"
+        }
     }
 
     /// Called from the render loop at roughly 4 Hz.
     func tick(force: Bool = false) {
         let now = hostNow()
-        guard force || now - lastTick >= 0.25 else { return }
+        lock.lock()
+        guard force || now - lastTick >= 0.25 else {
+            lock.unlock()
+            return
+        }
         let elapsed = max(0.001, now - intervalStart)
-
-        realFPS = Double(realCounter) / elapsed
-        generatedFPS = Double(generatedCounter) / elapsed
-        presentedFPS = Double(presentedCounter) / elapsed
-        frameTimeMs = frameTimeEMA.value ?? 0
-        gpuMs = gpuEMA.value ?? 0
-        flowMs = flowEMA.value ?? 0
-        aneMs = aneEMA.value ?? 0
-
+        let real = Double(realCounter) / elapsed
+        let generated = Double(generatedCounter) / elapsed
+        let presented = Double(presentedCounter) / elapsed
+        let frame = frameTimeEMA.value ?? 0
+        let gpu = gpuEMA.value ?? 0
+        let flow = flowEMA.value ?? 0
+        let ane = aneEMA.value ?? 0
         let latencies = latencyRing.elements
-        latencyP50 = Stats.percentile(latencies, 0.5)
-        latencyP95 = Stats.percentile(latencies, 0.95)
-
-        let system = SystemMetrics.shared.sample()
-        cpuPercent = system.cpuPercent
-        gpuPercent = system.gpuPercent
-        memoryMB = system.memoryMB
-        thermal = system.thermalState.shortName
-
-        sourceFPS = sourceMeter.value(at: now)
-
+        let p50 = Stats.percentile(latencies, 0.5)
+        let p95 = Stats.percentile(latencies, 0.95)
+        let source = sourceMeter.value(at: now)
         realCounter = 0
         generatedCounter = 0
         presentedCounter = 0
         intervalStart = now
         lastTick = now
+        lock.unlock()
+
+        let system = SystemMetrics.shared.sample()
+        publish {
+            self.realFPS = real
+            self.generatedFPS = generated
+            self.presentedFPS = presented
+            self.frameTimeMs = frame
+            self.gpuMs = gpu
+            self.flowMs = flow
+            self.aneMs = ane
+            self.latencyP50 = p50
+            self.latencyP95 = p95
+            self.sourceFPS = source
+            self.cpuPercent = system.cpuPercent
+            self.gpuPercent = system.gpuPercent
+            self.memoryMB = system.memoryMB
+            self.thermal = system.thermalState.shortName
+        }
     }
 
     func reset() {
+        lock.lock()
         sourceMeter.reset()
         latencyRing.removeAll()
         realCounter = 0
@@ -160,22 +189,41 @@ final class MetricsStore: ObservableObject {
         presentedCounter = 0
         intervalStart = hostNow()
         lastTick = intervalStart
-        cpuPercent = 0
-        gpuPercent = 0
-        memoryMB = 0
-        latencyP50 = 0
-        latencyP95 = 0
-        realFPS = 0
-        generatedFPS = 0
-        presentedFPS = 0
-        frameTimeMs = 0
-        gpuMs = 0
-        flowMs = 0
-        aneMs = 0
+        frameTimeEMA.reset()
+        gpuEMA.reset()
+        flowEMA.reset()
+        aneEMA.reset()
+        lock.unlock()
+        publish {
+            self.cpuPercent = 0
+            self.gpuPercent = 0
+            self.memoryMB = 0
+            self.latencyP50 = 0
+            self.latencyP95 = 0
+            self.realFPS = 0
+            self.generatedFPS = 0
+            self.presentedFPS = 0
+            self.frameTimeMs = 0
+            self.gpuMs = 0
+            self.flowMs = 0
+            self.aneMs = 0
+            self.sourceFPS = 0
+            self.calibrationProgress = 0
+            self.calibrationText = ""
+        }
+    }
+
+    private func publish(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
+        }
     }
 }
 
 enum PresentedKind {
     case real
     case generated
+    case duplicate
 }
