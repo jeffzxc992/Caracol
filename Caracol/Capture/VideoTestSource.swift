@@ -132,6 +132,14 @@ final class VideoTestSource {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        if DebugTrace.enabled {
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            let base = CVPixelBufferGetBaseAddress(pixelBuffer)?.assumingMemoryBound(to: UInt8.self)
+            let row = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            let probe = base.map { $0.advanced(by: row * (height / 2) + (width / 2) * 4) }
+            DebugTrace.log("video-probe", "\(width)x\(height) bpr \(row) center \(probe.map { "\($0[0]),\($0[1]),\($0[2]),\($0[3])" } ?? "no-base")")
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
         let frame = CapturedFrame(
             sequence: 0,
             pixelBuffer: pixelBuffer,

@@ -97,6 +97,18 @@ final class AppModel: NSObject, ObservableObject {
 
     private func parseLaunchArguments() {
         let arguments = CommandLine.arguments
+        if arguments.contains("--force-fullscreen") || arguments.contains("--target-fps") {
+            var overridden = settingsStore.settings
+            if arguments.contains("--force-fullscreen") {
+                overridden.forceFullScreen = true
+            }
+            if let index = arguments.firstIndex(of: "--target-fps"),
+               index + 1 < arguments.count,
+               let fps = Int(arguments[index + 1]) {
+                overridden.targetFPS = fps
+            }
+            settingsStore.settings = overridden.sanitized(displayRefresh: overridden.displayRefresh)
+        }
         if let index = arguments.firstIndex(of: "--video-test"),
            index + 1 < arguments.count {
             autoVideoURL = URL(fileURLWithPath: arguments[index + 1])
@@ -313,20 +325,26 @@ final class AppModel: NSObject, ObservableObject {
     private func startVideoPipeline(info: VideoTestInfo) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
-        let maximum = CGSize(width: visible.width * 0.82, height: visible.height * 0.82)
-        let aspect = info.size.width / max(1, info.size.height)
-        var size = maximum
-        if maximum.width / maximum.height > aspect {
-            size.width = (maximum.height * aspect).rounded()
+        let fullScreen = settingsStore.settings.forceFullScreen
+        let overlayRect: NSRect
+        if fullScreen {
+            overlayRect = screen.frame
         } else {
-            size.height = (maximum.width / aspect).rounded()
+            let maximum = CGSize(width: visible.width * 0.82, height: visible.height * 0.82)
+            let aspect = info.size.width / max(1, info.size.height)
+            var size = maximum
+            if maximum.width / maximum.height > aspect {
+                size.width = (maximum.height * aspect).rounded()
+            } else {
+                size.height = (maximum.width / aspect).rounded()
+            }
+            overlayRect = NSRect(
+                x: (visible.midX - size.width / 2).rounded(),
+                y: (visible.midY - size.height / 2).rounded(),
+                width: size.width,
+                height: size.height
+            )
         }
-        let overlayRect = NSRect(
-            x: (visible.midX - size.width / 2).rounded(),
-            y: (visible.midY - size.height / 2).rounded(),
-            width: size.width,
-            height: size.height
-        )
         let outputSize = CGSize(
             width: (overlayRect.width * screen.backingScaleFactor).rounded(),
             height: (overlayRect.height * screen.backingScaleFactor).rounded()
@@ -340,7 +358,7 @@ final class AppModel: NSObject, ObservableObject {
             bundleID: "com.caracol.video-test",
             windowID: nil,
             isDisplay: false,
-            fullScreenOverlay: false
+            fullScreenOverlay: fullScreen
         )
         activeLayout = layout
         metrics.setSource(CaptureSourceInfo(

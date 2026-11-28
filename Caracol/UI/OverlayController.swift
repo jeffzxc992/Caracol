@@ -56,7 +56,7 @@ final class OverlayController: NSObject, CAMetalDisplayLinkDelegate {
         window.isMovable = false
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
-        window.sharingType = .none
+        window.sharingType = DebugTrace.allowsCapture ? .readOnly : .none
         window.contentView = metalView
         window.setFrame(layout.overlayRect, display: false)
         metalView.frame = NSRect(origin: .zero, size: layout.overlayRect.size)
@@ -224,7 +224,7 @@ final class HUDController {
         window.isMovable = false
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
-        window.sharingType = .none
+        window.sharingType = DebugTrace.allowsCapture ? .readOnly : .none
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = hostingView

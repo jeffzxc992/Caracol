@@ -154,6 +154,7 @@ final class Renderer {
     private var lastRealSlotHostTime: CFTimeInterval = 0
     private var lastPresentHost: CFTimeInterval = 0
     private var sourceInterval = EMA(alpha: 0.2)
+    private var debugTexture: MTLTexture?
     private var sourceFPS: Double = 0
     private var generationCredit: Double = 0
     private var flowInFlight = false
@@ -323,6 +324,24 @@ final class Renderer {
         }
         zeroFlow = zero
 
+        if let debug = makeTexture(width: 2, height: 2, format: .bgra8Unorm,
+                                   usage: [.shaderRead], storage: .shared) {
+            let magenta = [UInt8](repeating: 0, count: 16)
+            var bytes = magenta
+            for i in stride(from: 0, to: 16, by: 4) {
+                bytes[i] = 255
+                bytes[i + 2] = 255
+                bytes[i + 3] = 255
+            }
+            bytes.withUnsafeBytes { raw in
+                if let base = raw.baseAddress {
+                    debug.replace(region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0,
+                                  withBytes: base, bytesPerRow: 8)
+                }
+            }
+            debugTexture = debug
+        }
+
         var newFlowSets: [FlowSet] = []
         for _ in 0..<2 {
             guard let lumaPrev = makeTexture(width: lumaWidth, height: lumaHeight, format: .r16Float,
@@ -415,6 +434,7 @@ final class Renderer {
     }
 
     private func ensureScaler() {
+        if DebugTrace.noScaler { scaler = nil; return }
         let inputWidth = Int(scalerInputSize.width)
         let inputHeight = Int(scalerInputSize.height)
         let outputWidth = Int(scalerOutputSize.width)
@@ -453,6 +473,7 @@ final class Renderer {
             set.addAllocation(flow.flowB)
         }
         if let zeroFlow { set.addAllocation(zeroFlow) }
+        if let debugTexture { set.addAllocation(debugTexture) }
         for texture in mlFlows { set.addAllocation(texture) }
         for buffer in flowUniformBuffers { set.addAllocation(buffer) }
         set.commit()
@@ -465,6 +486,7 @@ final class Renderer {
         let drawable = update.drawable
         let now = hostNow()
         let targetTime = update.targetPresentationTimestamp
+        DebugTrace.log("draw", "drawable \(drawable.texture.width)x\(drawable.texture.height) target-now \(String(format: "%.4f", targetTime - now)) output \(Int(config.outputSize.width))x\(Int(config.outputSize.height))")
 
         let drawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         if Int(drawableSize.width) != Int(config.outputSize.width) ||
@@ -476,6 +498,7 @@ final class Renderer {
         if let frame = mailbox.latest(after: lastSequence) {
             lastSequence = frame.sequence
             if let slot = makeSlot(frame) {
+                DebugTrace.log("mailbox", "new frame \(frame.sequence) at \(frame.pixelWidth)x\(frame.pixelHeight)")
                 if Int(slot.texture.width) != Int(config.inputSize.width) ||
                     Int(slot.texture.height) != Int(config.inputSize.height) {
                     config.inputSize = CGSize(width: slot.texture.width, height: slot.texture.height)
@@ -528,9 +551,6 @@ final class Renderer {
 
         if let previousReal = current {
             previous = previousReal
-            if !flowInFlight {
-                startFlow(previous: previousReal, current: slot)
-            }
         } else {
             previous = nil
         }
@@ -551,6 +571,16 @@ final class Renderer {
         metrics.noteSourceFrame(at: slot.hostTime)
         present(slot: slot, flowTexture: zeroFlow ?? slot.texture, t: 0, kind: .real,
                 interpolation: false, drawable: drawable, targetTime: targetTime)
+
+        // Queue the analysis for this pair only after the real frame has been
+        // committed. The flow runs on a second queue, but submitting it first
+        // lets the GPU pick it up before the frame the user is waiting for.
+        // If the source already meets the target there is no generated frame to
+        // feed, so skip flow entirely: it would only contend for GPU bandwidth.
+        let needsFlow = config.frameGeneration && Double(config.targetFPS) > sourceFPS + 0.5
+        if needsFlow, let previousReal = previous, !flowInFlight {
+            startFlow(previous: previousReal, current: slot)
+        }
     }
 
     private func makeSlot(_ frame: CapturedFrame) -> FrameSlot? {
@@ -607,6 +637,7 @@ final class Renderer {
     // MARK: - Flow
 
     private func startFlow(previous previousSlot: FrameSlot, current currentSlot: FrameSlot) {
+        guard !DebugTrace.noFlow else { return }
         guard !flowSets.isEmpty, !flowUniformBuffers.isEmpty, !flowInFlight else { return }
         let set = flowSets[nextFlowSet]
         nextFlowSet = (nextFlowSet + 1) % flowSets.count
@@ -629,12 +660,11 @@ final class Renderer {
 
         var blockUniforms = RenderUniforms()
         blockUniforms.p3.z = Float(config.flowBlock)
-        blockUniforms.p3.w = Float(config.flowBlock == 8 ? 6 : 10)
+        blockUniforms.p3.w = Float(config.flowBlock == 8 ? 4 : 6)
         let blockAddress = appendUniforms(blockUniforms, offset: &flowUniformOffset)
 
-        let refineUniforms = RenderUniforms()
+        var refineUniforms = RenderUniforms()
         let refineAAddress = appendUniforms(refineUniforms, offset: &flowUniformOffset)
-        let refineBAddress = appendUniforms(refineUniforms, offset: &flowUniformOffset)
 
         guard let lumaPrevTable = makeTable(address: lumaPrevAddress,
                                             textures: [(previousSlot.texture, 0), (set.lumaPrevious, 1)]),
@@ -643,9 +673,7 @@ final class Renderer {
               let blockTable = makeTable(address: blockAddress,
                                          textures: [(set.lumaPrevious, 0), (set.lumaCurrent, 1), (set.coarse, 2)]),
               let refineATable = makeTable(address: refineAAddress,
-                                           textures: [(set.lumaPrevious, 0), (set.lumaCurrent, 1), (set.coarse, 2), (set.flowA, 3)]),
-              let refineBTable = makeTable(address: refineBAddress,
-                                           textures: [(set.lumaPrevious, 0), (set.lumaCurrent, 1), (set.flowA, 2), (set.flowB, 3)]),
+                                           textures: [(set.lumaPrevious, 0), (set.lumaCurrent, 1), (set.coarse, 2), (set.flowB, 3)]),
               let allocator = flowAllocators.acquire(),
               let commandBuffer = device.makeCommandBuffer() else {
             flowInFlight = false
@@ -684,9 +712,6 @@ final class Renderer {
 
         encoder.setComputePipelineState(refinePipeline)
         encoder.setArgumentTable(refineATable)
-        encoder.dispatchThreads(threadsPerGrid: MTLSize(width: lumaWidth, height: lumaHeight, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-        encoder.setArgumentTable(refineBTable)
         encoder.dispatchThreads(threadsPerGrid: MTLSize(width: lumaWidth, height: lumaHeight, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         encoder.endEncoding()
@@ -792,7 +817,14 @@ final class Renderer {
                          interpolation: Bool,
                          drawable: CAMetalDrawable,
                          targetTime: CFTimeInterval) {
-        guard !targets.isEmpty else { return }
+        if DebugTrace.simplePresent {
+            presentBlack(drawable: drawable, targetTime: targetTime)
+            return
+        }
+        guard !targets.isEmpty else {
+            DebugTrace.log("present-fail", "no targets")
+            return
+        }
         let target = targets[targetIndex]
         targetIndex = (targetIndex + 1) % targets.count
 
@@ -812,16 +844,22 @@ final class Renderer {
             warpTable = makeTable(address: warpAddress,
                                   textures: [(slot.texture, 0), (previousTexture, 1),
                                              (flowTexture, 2), (target.warped, 3)])
-            if warpTable == nil { return }
+            if warpTable == nil {
+                DebugTrace.log("present-fail", "warp table")
+                return
+            }
         }
 
         var scalerInput = needsWarp ? target.warped : slot.texture
         if scaler != nil {
             scalerInput = target.scaled
         }
+        if DebugTrace.debugTexture, let debugTexture {
+            scalerInput = debugTexture
+        }
 
         var casUniforms = RenderUniforms()
-        casUniforms.p0 = SIMD4<Float>(0, 0, 0, config.sharpness)
+        casUniforms.p0 = SIMD4<Float>(0, 0, DebugTrace.fixedUV ? 2 : (DebugTrace.solidGreen ? 1 : 0), config.sharpness)
         casUniforms.p1 = SIMD4<Float>(Float(scalerInput.width), Float(scalerInput.height),
                                       Float(drawable.texture.width), Float(drawable.texture.height))
         casUniforms.p2 = SIMD4<Float>(Float(slot.texture.width) / Float(max(1, slot.texture.height)), 1, 0, 0)
@@ -829,6 +867,7 @@ final class Renderer {
         guard let casTable = makeTable(address: casAddress, textures: [(scalerInput, 0)]),
               let allocator = presentAllocators.acquire(),
               let commandBuffer = device.makeCommandBuffer() else {
+            DebugTrace.log("present-fail", "cas table/allocator/cb")
             return
         }
 
@@ -858,6 +897,7 @@ final class Renderer {
         }
 
         guard let renderEncoder = makeCASEncoder(commandBuffer, table: casTable, drawable: drawable) else {
+            DebugTrace.log("present-fail", "cas encoder")
             commandBuffer.endCommandBuffer()
             presentAllocators.recycle(allocator)
             return
@@ -870,7 +910,10 @@ final class Renderer {
             self?.presentAllocators.recycle(allocator)
             let ms = max(0, (feedback.gpuEndTime - feedback.gpuStartTime) * 1000.0)
             if let error = feedback.error {
+                DebugTrace.log("present-feedback", "error \(error)")
                 LogStore.error("render", "Present command buffer error: \(error)")
+            } else {
+                DebugTrace.log("present-feedback", "gpu \(String(format: "%.2f", ms)) ms")
             }
             self?.metrics.noteGPUTime(ms: ms)
         }
@@ -878,17 +921,17 @@ final class Renderer {
         let hostTime = slot.hostTime
         drawable.addPresentedHandler { [weak self] presentedDrawable in
             let latency = presentedDrawable.presentedTime - hostTime
+            DebugTrace.log("presented", "kind \(kind) latency \(String(format: "%.2f", latency * 1000)) ms presentedTime \(presentedDrawable.presentedTime)")
             self?.metrics.notePresented(kind: kind, latency: latency)
         }
 
         presentQueue.commit([commandBuffer], options: options)
         presentQueue.signalDrawable(drawable)
         let now = hostNow()
-        if targetTime > now {
-            drawable.present(at: targetTime)
-        } else {
-            drawable.present()
-        }
+        DebugTrace.log("present", "kind \(kind) t \(String(format: "%.2f", t)) commit target-now \(String(format: "%.4f", targetTime - now))")
+        // CAMetalDisplayLink schedules the drawable itself; presentation-time
+        // variants of present() assert when used with a display link.
+        drawable.present()
         if lastPresentHost > 0 {
             metrics.noteFrameTime(ms: (now - lastPresentHost) * 1000.0)
         }
@@ -902,7 +945,9 @@ final class Renderer {
         let pass = MTL4RenderPassDescriptor()
         pass.colorAttachments[0]?.texture = drawable.texture
         pass.colorAttachments[0]?.loadAction = .clear
-        pass.colorAttachments[0]?.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0]?.clearColor = DebugTrace.clearRed
+            ? MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)
+            : MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.colorAttachments[0]?.storeAction = .store
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             commandBuffer.endCommandBuffer()
@@ -913,16 +958,30 @@ final class Renderer {
         commandBuffer.endCommandBuffer()
 
         let options = MTL4CommitOptions()
-        options.addFeedbackHandler { [weak self] _ in
+        options.addFeedbackHandler { [weak self] feedback in
             self?.presentAllocators.recycle(allocator)
+            let ms = max(0, (feedback.gpuEndTime - feedback.gpuStartTime) * 1000.0)
+            self?.metrics.noteGPUTime(ms: ms)
+            if let error = feedback.error {
+                LogStore.error("render", "Clear command buffer error: \(error)")
+                DebugTrace.log("clear-feedback", "error \(error)")
+            } else {
+                DebugTrace.log("clear-feedback", "ok \(String(format: "%.2f", ms)) ms")
+            }
+        }
+        let drawableHostTime = hostNow()
+        drawable.addPresentedHandler { [weak self] presented in
+            DebugTrace.log("presented-black", "latency \(String(format: "%.2f", (presented.presentedTime - drawableHostTime) * 1000)) ms")
+            self?.metrics.notePresented(kind: .duplicate, latency: 0)
         }
         presentQueue.commit([commandBuffer], options: options)
-        presentQueue.signalDrawable(drawable)
-        if targetTime > hostNow() {
-            drawable.present(at: targetTime)
-        } else {
-            drawable.present()
+        if DebugTrace.presentStage >= 2 {
+            presentQueue.signalDrawable(drawable)
         }
+        DebugTrace.log("present-black", "stage \(DebugTrace.presentStage) target-now \(String(format: "%.4f", targetTime - hostNow()))")
+        guard DebugTrace.presentStage >= 3 else { return }
+        // See present(): CAMetalDisplayLink owns timing, so use present().
+        drawable.present()
     }
 
     private func makeCASEncoder(_ commandBuffer: MTL4CommandBuffer,

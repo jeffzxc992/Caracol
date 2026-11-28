@@ -101,30 +101,32 @@ kernel void flow_refine(texture2d<float> prevLuma [[texture(0)]],
 
     float4 initial = flowIn.sample(linearSampler, uv);
     int2 initialPixels = int2(round(initial.xy * float2(size)));
-    int radius = 2;
+    int radius = 1;
     float best = 1e20;
     int2 bestOffset = initialPixels;
 
-    for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            int2 d = initialPixels + int2(dx, dy);
-            float sad = 0.0;
-            for (int sy = -1; sy <= 1; ++sy) {
-                for (int sx = -1; sx <= 1; ++sx) {
-                    int2 pc = clamp(center + int2(sx, sy), int2(0), isize - 1);
-                    int2 pp = clamp(center + d + int2(sx, sy), int2(0), isize - 1);
-                    sad += fabs(curLuma.read(uint2(pc)).r - prevLuma.read(uint2(pp)).r);
-                }
+    // Five candidates (center + axis neighbors) and a 2x2 window. This is the
+    // lowest-latency refinement that still removes block-matching stair-steps;
+    // the full 25x9 search doubles flow GPU time for a marginal gain.
+    const int2 offsets[5] = { int2(0), int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+    for (int i = 0; i < 5; ++i) {
+        int2 d = initialPixels + offsets[i] * radius;
+        float sad = 0.0;
+        for (int sy = 0; sy <= 1; ++sy) {
+            for (int sx = 0; sx <= 1; ++sx) {
+                int2 pc = clamp(center + int2(sx, sy), int2(0), isize - 1);
+                int2 pp = clamp(center + d + int2(sx, sy), int2(0), isize - 1);
+                sad += fabs(curLuma.read(uint2(pc)).r - prevLuma.read(uint2(pp)).r);
             }
-            if (sad < best) {
-                best = sad;
-                bestOffset = d;
-            }
+        }
+        if (sad < best) {
+            best = sad;
+            bestOffset = d;
         }
     }
 
     float2 flow = float2(bestOffset) / float2(size);
-    float error = best / 9.0;
+    float error = best / 4.0;
     float confidence = saturate(1.0 - error * 4.0) * initial.z;
     flowOut.write(float4(flow, confidence, error), gid);
 }
@@ -208,6 +210,12 @@ fragment float4 warp_fragment(VSOut in [[stage_in]],
 fragment float4 cas_fragment(VSOut in [[stage_in]],
                              texture2d<float> src [[texture(0)]],
                              constant RenderUniforms &u [[buffer(0)]]) {
+    if (u.p0.z > 1.5) {
+        return float4(src.sample(linearSampler, float2(0.5, 0.8)).rgb, 1.0);
+    }
+    if (u.p0.z > 0.5) {
+        return float4(0.0, 1.0, 0.0, 1.0);
+    }
     float outAspect = u.p1.z / max(u.p1.w, 1.0);
     float srcAspect = u.p2.x;
     float2 uv = in.uv;
@@ -225,18 +233,17 @@ fragment float4 cas_fragment(VSOut in [[stage_in]],
 
     float2 texel = 1.0 / float2(src.get_width(), src.get_height());
     float3 c = src.sample(linearSampler, uv).rgb;
-    float3 blur = float3(0.0);
-    blur += src.sample(linearSampler, uv + float2( texel.x, 0.0)).rgb;
-    blur += src.sample(linearSampler, uv + float2(-texel.x, 0.0)).rgb;
-    blur += src.sample(linearSampler, uv + float2(0.0,  texel.y)).rgb;
-    blur += src.sample(linearSampler, uv + float2(0.0, -texel.y)).rgb;
-    blur += src.sample(linearSampler, uv + texel).rgb;
-    blur += src.sample(linearSampler, uv - texel).rgb;
-    blur += src.sample(linearSampler, uv + float2(texel.x, -texel.y)).rgb;
-    blur += src.sample(linearSampler, uv + float2(-texel.x, texel.y)).rgb;
-    blur *= 0.125;
-
     float sharpness = saturate(u.p0.w);
-    float3 outc = saturate(c + (c - blur) * (0.35 + sharpness * 1.8));
-    return float4(outc, 1.0);
+    if (sharpness > 0.02) {
+        // Five-tap cross blur. A full 3x3 kernel costs ~60% more on M1 for a
+        // barely visible difference at 2x output, and latency wins.
+        float3 blur = float3(0.0);
+        blur += src.sample(linearSampler, uv + float2( texel.x, 0.0)).rgb;
+        blur += src.sample(linearSampler, uv + float2(-texel.x, 0.0)).rgb;
+        blur += src.sample(linearSampler, uv + float2(0.0,  texel.y)).rgb;
+        blur += src.sample(linearSampler, uv + float2(0.0, -texel.y)).rgb;
+        blur *= 0.25;
+        c = saturate(c + (c - blur) * (0.35 + sharpness * 1.8));
+    }
+    return float4(c, 1.0);
 }

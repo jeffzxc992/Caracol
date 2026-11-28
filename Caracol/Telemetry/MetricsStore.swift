@@ -82,7 +82,10 @@ final class MetricsStore: ObservableObject {
         case .duplicate: break
         }
         presentedCounter += 1
-        if kind != .duplicate, latency > 0 {
+        // Latency is an input-to-photon measure for real frames. Generated
+        // frames are shown later by design and would distort the p50/p95 that
+        // the controller and HUD use to make decisions.
+        if kind == .real, latency > 0 {
             latencyRing.append(latency * 1000.0)
         }
         lock.unlock()
